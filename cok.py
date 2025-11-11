@@ -2,53 +2,90 @@ import aiohttp
 import asyncio
 import json
 from aiohttp import ClientSession
+from bs4 import BeautifulSoup
 
-# Konfigurasi dasar
-URL = "https://central.pophosting.com.br/index.php?rp=/domain/check"
+# === KONFIGURASI DASAR === #
+BASE_URL = "https://central.pophosting.com.br"
+CHECK_URL = f"{BASE_URL}/index.php?rp=/domain/check"
+TOKEN_PAGE = f"{BASE_URL}/cart.php?a=add&domain=register"
 
 HEADERS = {
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "Origin": "https://central.pophosting.com.br",
-    "Referer": "https://central.pophosting.com.br/cart.php?a=add&domain=register",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-    "X-Requested-With": "XMLHttpRequest",
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "origin": BASE_URL,
+    "priority": "u=1, i",
+    "referer": TOKEN_PAGE,
+    "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+    "x-requested-with": "XMLHttpRequest",
 }
 
 COOKIE_STRING = (
-    "WHMCSBoeDIcc27D1B=2bcdfb5e7846f763f211d79c7b11dc09; "
     "__stripe_mid=76e8ee20-4e29-41c3-a4f8-7eb101f17ad9077b99; "
-    "__stripe_sid=7ff9755a-8844-4bb3-925a-531d95b954a1098e77"
+    "_ga=GA1.1.1248964013.1761856247; "
+    "_ga_QEQ27X2HXJ=GS2.1.s1761856247$o1$g0$t1761856331$j60$l0$h0; "
+    "WHMCSBoeDIcc27D1B=557453e7a095db205c9dcbb284f42924; "
+    "__stripe_sid=cd3d804b-d9bb-431b-bd96-70abf5ffca5bb1f7f8"
 )
 COOKIES = dict(pair.split("=", 1) for pair in COOKIE_STRING.split("; "))
-TOKEN = "4802680f29c34fd31d50b9fffaf7d931275d879e"
 
-# Batas request paralel (ubah kalau ingin lebih cepat)
 MAX_CONCURRENT = 10
 
 
-async def check_domain(session: ClientSession, domain: str, sem: asyncio.Semaphore):
-    """Cek status domain secara async"""
+async def get_token(session: ClientSession) -> str:
+    """Ambil token dari halaman form"""
+    async with session.get(TOKEN_PAGE, cookies=COOKIES, timeout=15) as resp:
+        html = await resp.text()
+        soup = BeautifulSoup(html, "html.parser")
+
+        token_input = soup.select_one("#frmDomainChecker > input[type=hidden]:nth-child(1)")
+        if token_input and token_input.get("value"):
+            token = token_input["value"]
+            print(f"🔑 Token ditemukan: {token}")
+            return token
+        else:
+            raise ValueError("Tidak dapat menemukan token dari halaman.")
+
+
+async def check_domain(session: ClientSession, token: str, domain: str, sem: asyncio.Semaphore):
+    """Cek status domain secara async (mengikuti format cURL)"""
     async with sem:
-        data = {
-            "token": TOKEN,
+        payload = {
+            "token": token,
             "a": "checkDomain",
             "domain": domain.strip(),
-            "type": "domain",
+            "type": "spotlight",  # sesuai data cURL
         }
+
         try:
-            async with session.post(URL, data=data, cookies=COOKIES, timeout=15) as resp:
+            async with session.post(CHECK_URL, data=payload, cookies=COOKIES, timeout=20) as resp:
                 text = await resp.text()
+
                 try:
                     js = json.loads(text)
                 except json.JSONDecodeError:
                     print(f"⚠️ {domain} → Respons bukan JSON valid")
                     return ("error", domain)
 
-                info = js.get("result", [{}])[0]
-                legacy_status = info.get("legacyStatus", "").lower()
-                price = info.get("pricing", {}).get("1", {}).get("register", "N/A")
+                result_list = js.get("result", [])
+                if not result_list:
+                    print(f"⚠️ {domain} → Tidak ada data di 'result'")
+                    return ("unknown", domain)
+
+                # 🔍 Cari domain yang persis sama
+                target = next((r for r in result_list if r.get("domainName", "").lower() == domain.lower()), None)
+                if not target:
+                    print(f"🚫 {domain} → Tidak ditemukan di response")
+                    return ("unknown", domain)
+
+                legacy_status = target.get("legacyStatus", "").lower()
+                price = target.get("shortestPeriod", {}).get("register", "N/A")
 
                 if legacy_status == "available":
                     print(f"✅ {domain} → Available | Harga: {price}")
@@ -67,37 +104,33 @@ async def check_domain(session: ClientSession, domain: str, sem: asyncio.Semapho
 
 async def main():
     try:
-        with open("domains.txt", "r", encoding="utf-8") as f:
+        with open("domain.txt", "r", encoding="utf-8") as f:
             domains = [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
-        print("❌ File 'domains.txt' tidak ditemukan!")
+        print("❌ File 'domain.txt' tidak ditemukan!")
         return
 
-    print(f"🔍 Mengecek {len(domains)} domain...\n")
-
-    available, unavailable = [], []
-    sem = asyncio.Semaphore(MAX_CONCURRENT)
-
     async with aiohttp.ClientSession(headers=HEADERS) as session:
-        tasks = [check_domain(session, domain, sem) for domain in domains]
+        print("🔍 Mengambil token dari halaman...")
+        token = await get_token(session)
+
+        print(f"\n🔍 Mengecek {len(domains)} domain...\n")
+
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+        tasks = [check_domain(session, token, domain, sem) for domain in domains]
+
         for task in asyncio.as_completed(tasks):
             status, domain = await task
             if status == "available":
-                available.append(domain)
+                with open("domain_available.txt", "a", encoding="utf-8") as f:
+                    f.write(domain + "\n")
             elif status == "unavailable":
-                unavailable.append(domain)
-
-    # Simpan hasil
-    if available:
-        with open("available_domains.txt", "w", encoding="utf-8") as f:
-            f.write("\n".join(available))
-    if unavailable:
-        with open("unavailable_domains.txt", "w", encoding="utf-8") as f:
-            f.write("\n".join(unavailable))
+                with open("domain_unavailable.txt", "a", encoding="utf-8") as f:
+                    f.write(domain + "\n")
 
     print("\n✅ Pemeriksaan selesai.")
-    print(f"📁 {len(available)} domain tersedia → available_domains.txt")
-    print(f"📁 {len(unavailable)} domain tidak tersedia → unavailable_domains.txt")
+    print("📁 Domain tersedia → domain_available.txt")
+    print("📁 Domain tidak tersedia → domain_unavailable.txt")
 
 
 if __name__ == "__main__":
